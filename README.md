@@ -2,11 +2,34 @@
 
 Compile, build, and deploy Ubuntu Touch click packages all from the command line.
 
+## Install
+
+For a great tutorial on how to get started with clickable, check out the one in the
+[UBports Wiki](https://wiki.ubports.com/wiki/Set-up-an-app-development-environment).
+
+### Prerequisites
+
+* `adb` For installing and running commands on your device
+* `lxd` For building any binaries and the click package
+    * After installing lxd make sure you run `lxd init`
+
+### Via Snap
+
+* Download the latest version from the OpenStore: <https://open.uappexplorer.com/snap/clickable>
+* Install the snap: `sudo snap install --force-dangerous --classic <path/to/snap>`
+
+### Via Git
+
+* Clone this repo: `git clone https://github.com/bhdouglass/clickable.git`
+* Set the repo on your `PATH`
+
+### Post Setup
+
+Run `clickable setup-lxd` to create a container to build clicks and binaries in.
+
 ## Usage
 
-1) Put the `clickable` file on your PATH somewhere and make it executable
-
-2) Create a `clickable.json` file in your project root with the contents:
+1) Create a `clickable.json` file in your project root with the contents:
 
 ```
 {
@@ -28,10 +51,11 @@ Compile, build, and deploy Ubuntu Touch click packages all from the command line
   "default": "A list of space separated sub-commands to run when no sub-commands are specified",
   "dependencies": "An array of dependencies that will be installed in the build container",
   "ignore": "An array of files to ignore when building a 'pure' template [Optional, only for pure templates]",
+  "make_jobs": "number of jobs to use when running make, equivalent to make's -j option [Optional, if missing `make -j` will be run]",
 }
 ```
 
-3) From the root directory of your project you have the following sub-commands available:
+2) From the root directory of your project you have the following sub-commands available:
 
 * `clickable kill` - Kills a running process (specified by the config). Using this you can relaunch your app.
 * `clickable clean` - Cleans out the build dir
@@ -59,8 +83,10 @@ can specify the IP address in the clickable.json file's `ssh` property.
 Clickable supports building in a lxd container. In order to use them you first
 need to setup a container using `clickable setup-lxd` (once for each target architecture).
 This requires that you have `usdk-target` command installed. If you have the Ubuntu
-SDK IDE installed you should already have this command. If you are on a non-ubuntu
-distro, a prebuilt binary is included in this repo.
+SDK IDE installed you may already have this command installed, but the version
+included in this repo is more up to date than the Ubuntu SDK IDE verion. If
+you are not running Ubuntu or do not already have the SDK IDE setup you will
+need to use the usdk-target binary included in this repo.
 
 ## Chroot Building
 

@@ -14,42 +14,90 @@ import xml.etree.ElementTree as ElementTree
 # TODO add Golang template
 # TODO add desktop arch
 # TODO make a snap
-# TODO make sure lxd & lxd container is started
-# TODO don't print out a stack trace for CTRL+C and subprocess errors
 # TODO lxd setup shouldn't require a clickable.json
 # TODO check for a template based on CMake files, etc
-# TODO add command to uninstall
+
+class Colors:
+    INFO = '\033[94m'
+    SUCCESS = '\033[92m'
+    WARNING = '\033[93m'
+    ERROR = '\033[91m'
+    CLEAR = '\033[0m'
+
+def print_info(message):
+    print(Colors.INFO + message + Colors.CLEAR)
+
+def print_success(message):
+    print(Colors.SUCCESS + message + Colors.CLEAR)
+
+def print_warning(message):
+    print(Colors.WARNING + message + Colors.CLEAR)
+
+def print_error(message):
+    print(Colors.ERROR + message + Colors.CLEAR)
+
+def find_manifest(cwd, temp_dir=None, build_dir=None):
+    manifests = []
+    for (root, dirs, files) in os.walk(cwd, topdown=True):
+        for name in files:
+            if name == 'manifest.json':
+                manifests.append(os.path.join(root, name))
+
+    if not manifests:
+        raise Exception('Could not find manifest.json')
+
+    # Favor the manifest in the install dir first, then fall back to the build dir and finally the source dir
+    manifest = ''
+    for m in manifests:
+        if temp_dir and m.startswith(temp_dir):
+            manifest = m
+
+    if not manifest:
+        for m in manifests:
+            if build_dir and m.startswith(build_dir):
+                manifest = m
+
+    if not manifest:
+        manifest = manifests[0]
+
+    return manifest
+
+def get_manifest(cwd, temp_dir=None, build_dir=None):
+    manifest = {}
+    with open(find_manifest(cwd, temp_dir, build_dir), 'r') as f:
+        try:
+            manifest = json.load(f)
+        except ValueError:
+            raise ValueError('Failed reading "manifest.json", it is not valid json')
+
+    return manifest
 
 
 class Config(object):
-    package = None
-    app = None
-    sdk = 'ubuntu-sdk-15.04'
-    arch = 'armhf'
-    template = 'pure'
-    premake = None
-    postmake = None
-    prebuild = None
-    build = None
-    postbuild = None
-    launch = None
-    dir = './build/'
-    ssh = False
-    kill = None
-    scripts = {}
-    chroot = False
-    default = 'kill clean build click-build install launch'
-    log = None
-    specificDependencies = False
-    dependencies = []
-    ignore = []
-
-    required = ['sdk', 'arch', 'template', 'dir']
-    keys = [
-        'package', 'app', 'sdk', 'arch', 'prebuild', 'template', 'premake',
-        'postmake', 'build', 'postbuild', 'launch', 'dir', 'ssh', 'kill', 'scripts',
-        'chroot', 'default', 'log', 'specificDependencies', 'dependencies', 'ignore'
-    ]
+    config = {
+        'package': None,
+        'app': None,
+        'sdk': 'ubuntu-sdk-15.04',
+        'arch': 'armhf',
+        'template': None,
+        'premake': None,
+        'postmake': None,
+        'prebuild': None,
+        'build': None,
+        'postbuild': None,
+        'launch': None,
+        'dir': './build/',
+        'ssh': False,
+        'kill': None,
+        'scripts': {},
+        'chroot': False,
+        'default': 'kill clean build click-build install launch',
+        'log': None,
+        'specificDependencies': False,  # TODO make this less confusing
+        'dependencies': [],  # TODO support this being a string
+        'ignore': [],
+        'make_jobs': 0,
+    }
 
     PURE_QML_QMAKE = 'pure-qml-qmake'
     QMAKE = 'qmake'
@@ -58,10 +106,12 @@ class Config(object):
     CUSTOM = 'custom'
     CORDOVA = 'cordova'
     PURE = 'pure'
+    PYTHON = 'python'
 
-    templates = [PURE_QML_CMAKE, QMAKE, PURE_QML_CMAKE, CMAKE, CUSTOM, CORDOVA, PURE]
+    required = ['sdk', 'arch', 'dir']
+    templates = [PURE_QML_QMAKE, QMAKE, PURE_QML_CMAKE, CMAKE, CUSTOM, CORDOVA, PURE, PYTHON]
 
-    def __init__(self, ip=None, arch=None, template=None):
+    def __init__(self, ip=None, arch=None, template=None, skip_detection=False):
         self.cwd = os.getcwd()
         self.load_config()
 
@@ -73,6 +123,12 @@ class Config(object):
 
         if template:
             self.template = template
+
+        if skip_detection:
+            if not template:
+                self.template = self.PURE
+        else:
+            self.detect_template()
 
         if not self.kill:
             if self.template == self.CORDOVA:
@@ -91,6 +147,12 @@ class Config(object):
         if self.template not in self.templates:
             raise ValueError('"{}" is not a valid template ({})'.format(self.template, ', '.join(self.templates)))
 
+    def __getattr__(self, name):
+        return self.config[name]
+
+    def __setattr__(self, name, value):
+        self.config[name] = value
+
     def load_config(self, file='clickable.json'):
         if os.path.isfile(os.path.join(self.cwd, file)):
             with open(os.path.join(self.cwd, file), 'r') as f:
@@ -100,13 +162,13 @@ class Config(object):
                 except ValueError:
                     raise ValueError('Failed reading "{}", it is not valid json'.format(file))
 
-                for key in self.keys:
+                for key in self.config:
                     value = config_json.get(key, None)
 
                     if value:
-                        setattr(self, key, value)
+                        self.config[key] = value
         else:
-            print('No clickable.json was found, using defaults and cli args')
+            print_warning('No clickable.json was found, using defaults and cli args')
 
         for key in self.required:
             if not getattr(self, key):
@@ -114,9 +176,43 @@ class Config(object):
 
         self.dir = os.path.abspath(self.dir)
 
+    def detect_template(self):
+        if not self.template:
+            template = None
+
+            try:
+                manifest = get_manifest(os.getcwd())
+            except ValueError:
+                manifest = None
+
+            directory = os.listdir(os.getcwd())
+            if not template and 'CMakeLists.txt' in directory:
+                template = Config.CMAKE
+
+                if manifest and manifest.get('architecture', None) == 'all':
+                    template = Config.PURE_QML_CMAKE
+
+            pro_files = [f for f in directory if f.endswith('.pro')]
+
+            if pro_files:
+                template = Config.QMAKE
+
+                if manifest and manifest.get('architecture', None) == 'all':
+                    template = Config.PURE_QML_QMAKE
+
+            if not template and 'config.xml' in directory:
+                template = Config.CORDOVA
+
+            if not template:
+                template = Config.PURE
+
+            self.template = template
+            print_info('Auto detected template to be "{}"'.format(template))
+
 
 class Clickable(object):
     cwd = None
+    usdk_target = 'usdk-target'
 
     def __init__(self, config, device_serial_number=None):
         self.cwd = os.getcwd()
@@ -128,31 +224,47 @@ class Clickable(object):
 
         self.host_arch = 'amd64' if platform.architecture()[0] == '64bit' else 'i386'
         self.build_arch = self.config.arch
-        if self.config.template == self.config.PURE_QML_QMAKE or self.config.template == self.config.PURE_QML_CMAKE or self.config.PURE:
+        if self.config.template == self.config.PURE_QML_QMAKE or self.config.template == self.config.PURE_QML_CMAKE or self.config.template == self.config.PURE:
             self.build_arch = 'armhf'
 
-    def find_manifest(self):
-        # TODO the manifest might not be in the build directory, check in the src directory
-        # TODO write this in python
-
-        manifest = ''
-        if self.config.template == self.config.PURE:
-            manifest = subprocess.check_output('find . -name "manifest.json" -print', cwd=self.config.dir, shell=True)
+        if self.config.ssh:
+            self.check_command('ssh')
+            self.check_command('scp')
         else:
-            manifest = subprocess.check_output('find . -path ./tmp -prune -o -name "manifest.json" -print', cwd=self.config.dir, shell=True)
+            self.check_command('adb')
 
-        # TODO error if not found
-        return os.path.join(self.config.dir, manifest.strip())
+        if self.config.chroot:
+            self.check_command('click')
+
+        if self.config.template == Config.CORDOVA:
+            self.check_command('cordova')
+
+        if 'SNAP' in os.environ and os.environ['SNAP']:
+            # If running as a snap, trick usdk-target into thinking its not in a snap
+            del os.environ['SNAP']
+
+        usdk_target_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'usdk-target')
+        if os.path.isfile(usdk_target_path):
+            self.usdk_target = usdk_target_path
+        else:
+            try:
+                self.check_command('usdk-target')
+            except Exception:
+                raise Exception('The command "usdk-target" does not exist on this system, you can find it in the clickable repo')
+
+            print_warning('Using the system version of usdk-target and not clickable\'s')
+
+    def check_command(self, command):
+        error_code = subprocess.call(shlex.split('which {}'.format(command)), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        if error_code != 0:
+            raise Exception('The command "{}" does not exist on this system, please install it for clickable to work properly"'.format(command))
+
+    def find_manifest(self):
+        return find_manifest(self.cwd, self.temp, self.config.dir)
 
     def get_manifest(self):
-        manifest = {}
-        with open(self.find_manifest(), 'r') as f:
-            try:
-                manifest = json.load(f)
-            except ValueError:
-                raise ValueError('Failed reading "manifest.json", it is not valid json')
-
-        return manifest
+        return get_manifest(self.cwd, self.temp, self.config.dir)
 
     def find_version(self):
         return self.get_manifest().get('version', '1.0')
@@ -212,8 +324,7 @@ class Clickable(object):
 
             wrapped_command = 'click chroot -a {} -f {} {} {}'.format(self.build_arch, self.config.sdk, chroot_command, command)
         else:
-            if not self.check_lxd():
-                raise Exception('No lxd container exists to build in, please run `clickable setup-lxd`')
+            self.check_lxd()
 
             target_command = 'exec'
             if sudo:
@@ -222,7 +333,7 @@ class Clickable(object):
             if use_dir:
                 command = 'cd {}; {}'.format(self.config.dir, command)
 
-            wrapped_command = 'usdk-target {} clickable-{} -- bash -c "{}"'.format(target_command, self.build_arch, command)
+            wrapped_command = '{} {} clickable-{} -- bash -c "{}"'.format(self.usdk_target, target_command, self.build_arch, command)
 
         kwargs = {}
         if use_dir:
@@ -235,7 +346,7 @@ class Clickable(object):
 
     def setup_dependencies(self):
         if len(self.config.dependencies) > 0:
-            print('Checking dependencies')
+            print_info('Checking dependencies')
 
             command = 'apt-get install -y --force-yes'
             run = False
@@ -256,13 +367,34 @@ class Clickable(object):
             if run:
                 self.run_container_command(command, sudo=True, use_dir=False)
             else:
-                print('Dependencies already installed')
+                print_info('Dependencies already installed')
 
     def check_lxd(self):
         name = 'clickable-{}'.format(self.build_arch)
 
+        status = ''
+        try:
+            status = subprocess.check_output(shlex.split('{} status {}'.format(self.usdk_target, name)), stderr=subprocess.STDOUT)
+            status = json.loads(status)['status']
+        except subprocess.CalledProcessError as e:
+            if e.output.strip() == 'error: Could not connect to the LXD server.':
+                # TODO explain how to start lxd and/or try to start it
+                raise Exception('LXD is not running, please start it')
+            elif e.output.strip() == 'error: Could not query container status. error: not found':
+                raise Exception('No lxd container exists to build in, please run `clickable setup-lxd`')
+            else:
+                print(e.output)
+                raise e
+
+        if status != 'Running':
+            print_info('Going to start lxd container "{}"'.format(name))
+            subprocess.check_call(shlex.split('lxc start {}'.format(name)))
+
+    def lxd_container_exists(self):
+        name = 'clickable-{}'.format(self.build_arch)
+
         # Check for existing container
-        existing = subprocess.check_output(shlex.split('usdk-target list'))
+        existing = subprocess.check_output(shlex.split('{} list'.format(self.usdk_target)))
         existing = json.loads(existing)
 
         found = False
@@ -276,11 +408,13 @@ class Clickable(object):
         name = 'clickable-{}'.format(self.build_arch)
         alias = '{}-{}-{}-dev'.format(self.config.sdk, self.host_arch, self.build_arch)
 
-        if not self.check_lxd():
-            print('Going to setup the lxd container')
+        if self.lxd_container_exists():
+            print_success('Container already exists, nothing to do')
+        else:
+            print_info('Going to setup the lxd container')
 
             # Find the image we want
-            images = subprocess.check_output(shlex.split('usdk-target images'))
+            images = subprocess.check_output(shlex.split('{} images'.format(self.usdk_target)))
             images = json.loads(images)
 
             fingerprint = None
@@ -291,13 +425,20 @@ class Clickable(object):
             if not fingerprint:
                 raise Exception('The {} lxd image could not be found'.format(alias))
 
-            print('Asking for root to create the lxd container')
+            print_info('Asking for root to create the lxd container')
+
+            # If set, pass along the USDK_TEST_REMOTE env var (this allows user to use a different sdk image server)
+            env = ''
+            if 'USDK_TEST_REMOTE' in os.environ:
+                env = 'USDK_TEST_REMOTE={}'.format(os.environ['USDK_TEST_REMOTE'])
 
             # Create a new container
-            subprocess.check_call(shlex.split('sudo usdk-target create -n {} -p {}'.format(name, fingerprint)))
+            subprocess.check_call(shlex.split('sudo {} {} create -n {} -p {}'.format(env, self.usdk_target, name, fingerprint)))
 
             self.run_container_command('apt-get update', force_lxd=True, sudo=True, use_dir=False)
             self.run_container_command('apt-get install -y --force-yes click', force_lxd=True, sudo=True, use_dir=False)
+
+            print_success('Finished setting up the lxd container')
 
     def click_build(self):
         command = 'click build {} --no-validate'.format(self.temp)
@@ -371,7 +512,7 @@ class Clickable(object):
             if type == OSError and 'No such file or directory' in value:  # TODO see if there is a proper way to do this
                 pass  # Nothing to do here, the directory didn't exist
             else:
-                print('Failed to clean the build directory: {}: {}'.format(type, value))
+                print_warning('Failed to clean the build directory: {}: {}'.format(type, value))
 
         try:
             shutil.rmtree(self.temp)
@@ -380,7 +521,7 @@ class Clickable(object):
             if type == OSError and 'No such file or directory' in value:  # TODO see if there is a proper way to do this
                 pass  # Nothing to do here, the directory didn't exist
             else:
-                print('Failed to clean the temp directory: {}: {}'.format(type, value))
+                print_warning('Failed to clean the temp directory: {}: {}'.format(type, value))
 
     def _build(self):
         raise NotImplementedError()
@@ -389,7 +530,7 @@ class Clickable(object):
         try:
             os.makedirs(self.config.dir)
         except:
-            print('Failed to create the build directory: {}'.format(str(sys.exc_info()[0])))
+            print_warning('Failed to create the build directory: {}'.format(str(sys.exc_info()[0])))
 
         self.setup_dependencies()
 
@@ -419,7 +560,11 @@ class MakeClickable(Clickable):
             subprocess.check_call(self.config.premake, cwd=self.config.dir, shell=True)
 
     def make(self):
-        self.run_container_command('make')
+        command = 'make -j'
+        if self.config.make_jobs:
+            command = '{}{}'.format(command, self.config.make_jobs)
+
+        self.run_container_command(command)
 
     def make_install(self):
         if os.path.exists(self.temp) and os.path.isdir(self.temp):
@@ -428,7 +573,7 @@ class MakeClickable(Clickable):
         try:
             os.makedirs(self.temp)
         except:
-            print('Failed to create temp dir ({}): {}'.format(self.temp, str(sys.exc_info()[0])))
+            print_warning('Failed to create temp dir ({}): {}'.format(self.temp, str(sys.exc_info()[0])))
 
         # The actual make command is implemented in the subclasses
 
@@ -461,7 +606,6 @@ class QMakeClickable(MakeClickable):
         if self.build_arch == 'armhf':
             self.run_container_command('qt5-qmake-arm-linux-gnueabihf {}'.format(self.cwd))
         else:
-            # TODO implement this
             raise Exception('{} is not supported by the qmake build yet'.format(self.build_arch))
 
         super(QMakeClickable, self)._build()
@@ -508,7 +652,12 @@ class PureClickable(Clickable):
 
     def _build(self):
         shutil.copytree(self.cwd, self.temp, ignore=self._ignore)
-        print('Copied files to temp directory for click building')
+        print_info('Copied files to temp directory for click building')
+
+
+class PythonClickable(PureClickable):
+    # The only difference between this and the Pure template is that this doesn't force the "all" arch
+    pass
 
 
 class CordovaClickable(Clickable):
@@ -600,40 +749,59 @@ if __name__ == "__main__":
         '-p',
         help='Launches the specified app (use with the "launch" command)'
     )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Runs in debug mode'
+    )
     args = parser.parse_args()
 
-    config = Config(ip=args.ip, arch=args.arch, template=args.template)
-    clickable = None
-    if config.template == config.PURE_QML_QMAKE:
-        clickable = PureQMLQMakeClickable(config, args.device_serial_number)
-    elif config.template == config.QMAKE:
-        clickable = QMakeClickable(config, args.device_serial_number)
-    elif config.template == config.PURE_QML_CMAKE:
-        clickable = PureQMLCMakeClickable(config, args.device_serial_number)
-    elif config.template == config.CMAKE:
-        clickable = CMakeClickable(config, args.device_serial_number)
-    elif config.template == config.CUSTOM:
-        clickable = CustomClickable(config, args.device_serial_number)
-    elif config.template == config.CORDOVA:
-        clickable = CordovaClickable(config, args.device_serial_number)
-    elif config.template == config.PURE:
-        clickable = PureClickable(config, args.device_serial_number)
+    skip_detection = False
+    if args.click:
+        skip_detection = True
+    elif 'setup-lxd' in args.commands:
+        skip_detection = True
 
-    commands = args.commands
-    if len(args.commands) == 0:
-        commands = config.default.split(' ')
+    try:
+        config = Config(ip=args.ip, arch=args.arch, template=args.template, skip_detection=skip_detection)
+        clickable = None
+        if config.template == config.PURE_QML_QMAKE:
+            clickable = PureQMLQMakeClickable(config, args.device_serial_number)
+        elif config.template == config.QMAKE:
+            clickable = QMakeClickable(config, args.device_serial_number)
+        elif config.template == config.PURE_QML_CMAKE:
+            clickable = PureQMLCMakeClickable(config, args.device_serial_number)
+        elif config.template == config.CMAKE:
+            clickable = CMakeClickable(config, args.device_serial_number)
+        elif config.template == config.CUSTOM:
+            clickable = CustomClickable(config, args.device_serial_number)
+        elif config.template == config.CORDOVA:
+            clickable = CordovaClickable(config, args.device_serial_number)
+        elif config.template == config.PURE:
+            clickable = PureClickable(config, args.device_serial_number)
+        elif config.template == config.PYTHON:
+            clickable = PythonClickable(config, args.device_serial_number)
 
-    for command in commands:
-        if command in config.scripts:
-            clickable.script(command, args.device)
-        elif command == 'install':
-            clickable.install(args.click)
-        elif command == 'launch':
-            clickable.launch(args.app)
-        elif command in COMMAND_HANDLERS:
-            getattr(clickable, COMMAND_HANDLERS[command])()
-        elif command == 'help':
-            parser.print_help()
+        commands = args.commands
+        if len(args.commands) == 0:
+            commands = config.default.split(' ')
+
+        for command in commands:
+            if command in config.scripts:
+                clickable.script(command, args.device)
+            elif command == 'install':
+                clickable.install(args.click)
+            elif command == 'launch':
+                clickable.launch(args.app)
+            elif command in COMMAND_HANDLERS:
+                getattr(clickable, COMMAND_HANDLERS[command])()
+            elif command == 'help':
+                parser.print_help()
+            else:
+                print_error('There is no builtin or custom command named "{}"'.format(command))
+                print_valid_commands()
+    except:
+        if args.debug:
+            raise
         else:
-            print('There is no builtin or custom command named "{}"'.format(command))
-            print_valid_commands()
+            print_error(str(sys.exc_info()[1]))
